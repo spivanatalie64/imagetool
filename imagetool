@@ -1,167 +1,116 @@
 #!/usr/bin/env python3
 """
-imagetool — CLI image editor using OpenCV + PIL.
-Apply blur, darken, watermark removal, and other effects
-with precise pixel coordinates.
+imagetool — CLI image editor using OpenCV.
+
+Usage:
+  imagetool <image> info                        Show image info
+  imagetool <image> bg-black [x y w h]          Make background black (GrabCut)
+  imagetool <image> darken <0-100>              Darken image
+  imagetool <image> blur <x y w h> <r>          Blur region
+  imagetool <image> mask-save <output>          Save computed mask
+  imagetool <image> view                        ASCII preview
 """
 import cv2
 import numpy as np
 import sys
 import os
-from pathlib import Path
 
-HELP = """Usage: imagetool <input> <command> [args...]
+HELP = __doc__
 
-Commands:
-  blur <x1> <y1> <x2> <y2> <radius>   Blur a region
-  darken <percent>                     Darken whole image (0-100)
-  brighten <percent>                   Brighten whole image
-  mask <x1> <y1> <x2> <y2>            Save mask preview
-  info                                 Show image info
-  view                                 Show ASCII preview (small)
-  crop <x1> <y1> <x2> <y2>            Crop
-  resize <width> <height>              Resize
-  remove-watermark <x> <y> <w> <h>    Inpaint region
-  radial-blur <strength>              Blur edges, keep center sharp
+def load(p): return cv2.imread(str(p))
+def save(img, p): cv2.imwrite(str(p), img, [cv2.IMWRITE_JPEG_QUALITY, 97])
 
-Coordinate format: x1 y1 x2 y2 (top-left to bottom-right)
-Use 'imagetool info <image>' to get dimensions first.
-"""
-
-def load(img):
-    return cv2.imread(str(img))
-
-def save(img, path):
-    cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-def cmd_info(args):
+def info(args):
     img = load(args[0])
     h, w = img.shape[:2]
-    print(f"Dimensions: {w}x{h}")
-    print(f"Channels: {img.shape[2] if len(img.shape) > 2 else 1}")
-    mean = cv2.mean(img)[:3]
-    print(f"Avg color: R={mean[2]:.0f} G={mean[1]:.0f} B={mean[0]:.0f}")
+    print(f"{w}x{h} RGB")
+    m = cv2.mean(img)[:3]
+    print(f"Avg: R={m[2]:.0f} G={m[1]:.0f} B={m[0]:.0f}")
+    print(f"Range: {img.min()}–{img.max()}")
 
-def cmd_blur(args):
-    path, x1, y1, x2, y2, r = args[0], int(args[1]), int(args[2]), int(args[3]), int(args[4]), int(args[5])
-    img = load(path)
-    roi = img[y1:y2, x1:x2]
-    blurred = cv2.GaussianBlur(roi, (r*2+1, r*2+1), r//2)
-    img[y1:y2, x1:x2] = blurred
-    save(img, path)
-    print(f"Blurred region ({x1},{y1})-({x2},{y2}) radius {r}")
-
-def cmd_darken(args):
-    path, pct = args[0], float(args[1])
-    img = load(path)
-    alpha = 1.0 - pct/100
-    dark = cv2.convertScaleAbs(img, alpha=alpha, beta=-10)
-    save(dark, path)
-    print(f"Darkened by {pct}%")
-
-def cmd_brighten(args):
-    path, pct = args[0], float(args[1])
-    img = load(path)
-    alpha = 1.0 + pct/100
-    bright = cv2.convertScaleAbs(img, alpha=alpha, beta=10)
-    save(bright, path)
-    print(f"Brightened by {pct}%")
-
-def cmd_remove_watermark(args):
-    path, x, y, w, h = args[0], int(args[1]), int(args[2]), int(args[3]), int(args[4])
-    img = load(path)
-    mask = np.zeros(img.shape[:2], dtype=np.uint8)
-    mask[y:y+h, x:x+w] = 255
-    result = cv2.inpaint(img, mask, 5, cv2.INPAINT_TELEA)
-    save(result, path)
-    print(f"Watermark removed at ({x},{y})-({x+w},{y+h})")
-
-def cmd_radial_blur(args):
-    path, strength = args[0], float(args[1])
+def bg_black(args):
+    """Remove background with GrabCut. Optionally provide bounding rect."""
+    path = args[0]
     img = load(path)
     h, w = img.shape[:2]
-    cx, cy = w//2, h//2
-    Y, X = np.ogrid[:h, :w]
-    dist = np.sqrt((X - cx)**2 + (Y - cy)**2)
-    # Scale to amount of blur per distance
-    max_d = np.sqrt(cx**2 + cy**2)
-    norm = np.minimum(dist / (max_d * 0.7), 1.0)
-    k_size = int(strength * 2 + 1)
-    blurred = cv2.GaussianBlur(img, (k_size, k_size), strength)
-    very = cv2.GaussianBlur(img, (k_size*2+1, k_size*2+1), strength*3)
-    mask = (norm * 255).astype(np.uint8)
-    mask = cv2.GaussianBlur(mask, (k_size, k_size), strength)
-    mf = mask.astype(np.float32)[:,:,None] / 255.0
-    result = (1 - mf) * img.astype(np.float32) + mf * blurred.astype(np.float32)
-    # Outer edges: blend to very blurred
-    outer = np.maximum(norm - 0.5, 0) * 2
-    om = (outer * 255).astype(np.uint8)
-    om = cv2.GaussianBlur(om, (41, 41), 20)
-    omf = om.astype(np.float32)[:,:,None] / 255.0
-    result = (1 - omf) * result + omf * very.astype(np.float32)
-    result = np.clip(result, 0, 255).astype(np.uint8)
+    mask = np.zeros((h, w), np.uint8)
+    bgd = np.zeros((1,65), np.float64)
+    fgd = np.zeros((1,65), np.float64)
+
+    if len(args) >= 5:
+        rx, ry, rw, rh = int(args[1]), int(args[2]), int(args[3]), int(args[4])
+        rect = (rx, ry, rw, rh)
+        print(f"Using rect: ({rx},{ry}) {rw}x{rh}")
+    else:
+        # Auto: assume subject is centered, take center 60% as probable foreground
+        margin_x, margin_y = int(w*0.2), int(h*0.2)
+        rect = (margin_x, margin_y, w - 2*margin_x, h - 2*margin_y)
+        print(f"Auto rect (centered): {rect}")
+
+    cv2.grabCut(img, mask, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+    
+    # GC_FGD=1, GC_PR_FGD=3 => foreground
+    fg_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    
+    # Clean up mask
+    kernel = np.ones((5,5), np.uint8)
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    fg_mask = cv2.GaussianBlur(fg_mask.astype(np.float32), (15,15), 7)
+    
+    # Apply: black background, keep foreground
+    mf = fg_mask[:,:,None].astype(np.float32) / 255.0
+    result = (img.astype(np.float32) * mf).astype(np.uint8)
+    
+    # Save mask for verification
+    mask_out = os.path.splitext(path)[0] + "_mask.png"
+    cv2.imwrite(mask_out, fg_mask)
+    print(f"Mask saved: {mask_out}")
+    
     save(result, path)
-    print(f"Radial blur applied (strength={strength})")
+    print(f"Background removed → {path}")
 
-def cmd_crop(args):
-    path = args[0]
-    x1, y1, x2, y2 = int(args[1]), int(args[2]), int(args[3]), int(args[4])
-    img = load(path)
-    cropped = img[y1:y2, x1:x2]
-    save(cropped, path)
-    print(f"Cropped to {x2-x1}x{y2-y1}")
+def darken(args):
+    img = load(args[0])
+    pct = float(args[1])
+    a = 1.0 - pct/100
+    d = cv2.convertScaleAbs(img, alpha=a, beta=-15)
+    save(d, args[0])
+    print(f"Darkened {pct}%")
 
-def cmd_resize(args):
-    path, w, h = args[0], int(args[1]), int(args[2])
-    img = load(path)
-    resized = cv2.resize(img, (w, h))
-    save(resized, path)
-    print(f"Resized to {w}x{h}")
+def blur(args):
+    img = load(args[0])
+    x, y, bw, bh = int(args[1]), int(args[2]), int(args[3]), int(args[4])
+    r = int(args[5])
+    k = r*2+1
+    img[y:y+bh, x:x+bw] = cv2.GaussianBlur(img[y:y+bh, x:x+bw], (k, k), r//2)
+    save(img, args[0])
+    print(f"Blurred ({x},{y})-({x+bw},{y+bh}) r={r}")
 
-def cmd_view(args):
-    path = args[0]
-    os.system(f"chafa {path} 2>/dev/null || python3 -c \"
-from PIL import Image
-img = Image.open('{path}')
-img.thumbnail((80, 60))
-w, h = img.size
-px = list(img.getdata())
-chars = '@%#*+=-:. '
-for y in range(h):
-    line = ''
-    for x in range(w):
-        p = px[y*w + x]
-        if isinstance(p, tuple):
-            b = sum(p[:3]) / 3
-        else:
-            b = p
-        idx = int(b / 256 * len(chars))
-        line += chars[min(idx, len(chars)-1)]
-    print(line)
-\"")
+def mask_save(args):
+    img = load(args[0])
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Try edge + threshold
+    blur = cv2.GaussianBlur(gray, (15,15), 5)
+    edges = cv2.Canny(blur, 30, 100)
+    cv2.imwrite(args[1], edges)
+    print(f"Edge mask saved: {args[1]}")
+
+def view(args):
+    os.system(f"chafa {args[0]} 2>/dev/null || echo 'Install chafa for preview'")
 
 def main():
     if len(sys.argv) < 3:
-        print(HELP)
-        sys.exit(1)
+        print(HELP); sys.exit(1)
+    p = sys.argv[1]
+    if not os.path.exists(p):
+        print(f"Not found: {p}"); sys.exit(1)
     cmd = sys.argv[2]
-    args = sys.argv[1:]
-    cmds = {
-        "info": cmd_info,
-        "blur": cmd_blur,
-        "darken": cmd_darken,
-        "brighten": cmd_brighten,
-        "remove-watermark": cmd_remove_watermark,
-        "radial-blur": cmd_radial_blur,
-        "crop": cmd_crop,
-        "resize": cmd_resize,
-        "view": cmd_view,
-    }
+    a = sys.argv[3:]
+    cmds = {"info":info,"bg-black":bg_black,"darken":darken,"blur":blur,"mask-save":mask_save,"view":view}
     if cmd not in cmds:
-        print(f"Unknown command: {cmd}")
-        print(HELP)
-        sys.exit(1)
-    cmds[cmd](args[1:])  # skip script name
+        print(f"Unknown: {cmd}"); print(HELP); sys.exit(1)
+    cmds[cmd]([p]+a)
 
 if __name__ == "__main__":
     main()
